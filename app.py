@@ -1,4 +1,4 @@
-import os
+import os, re
 import sqlite3
 import pandas as pd
 import streamlit as st
@@ -44,6 +44,7 @@ st.set_page_config(
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA foreign_keys = ON;")  # Enable foreign keys for cascade deletes
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -132,6 +133,16 @@ def fetch_inventory():
     conn.close()
     return df
 
+def fetch_all_media_ids():
+    """Fetches ordered list of all existing media IDs."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT media_id FROM inventory ORDER BY media_id ASC")
+    rows = c.fetchall()
+    conn.close()
+    return [row["media_id"] for row in rows]
+
+
 
 def fetch_item_by_id(media_id):
     conn = get_db_connection()
@@ -152,6 +163,91 @@ def fetch_works_for_media(media_id):
     rows = c.fetchall()
     conn.close()
     return [row["work_name"] for row in rows]
+
+def generate_next_media_id(cursor, prefix="GFD_AV_"):
+    """Fetches the highest numeric suffix for the prefix and increments it."""
+    cursor.execute(
+        "SELECT media_id FROM inventory WHERE media_id LIKE ? ORDER BY media_id DESC",
+        (f"{prefix}%",),
+    )
+    rows = cursor.fetchall()
+
+    max_num = 0
+    for (m_id,) in rows:
+        match = re.search(r"(\d+)$", m_id)
+        if match:
+            num = int(match.group(1))
+            if num > max_num:
+                max_num = num
+
+    next_num = max_num + 1
+    return f"{prefix}{next_num:04d}"
+
+def duplicate_record(source_media_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # 1. Fetch source record
+    cursor.execute(
+        "SELECT * FROM inventory WHERE media_id = ?", (source_media_id,)
+    )
+    columns = [col[0] for col in cursor.description]
+    row = cursor.fetchone()
+
+    if row:
+        data = dict(zip(columns, row))
+
+        # 2. Extract base prefix (e.g., 'GFD_AV_') and generate next incremental media_id
+        match = re.match(r"^(.*?)(\d+)$", source_media_id)
+        prefix = match.group(1) if match else "GFD_AV_"
+        new_media_id = generate_next_media_id(cursor, prefix=prefix)
+
+        # 3. Update record fields for the new copy
+        data["media_id"] = new_media_id
+        if "item_title" in data and data["item_title"]:
+            data["item_title"] = f"{data['item_title']} (Copy)"
+
+        # Remove timestamp to let SQLite use CURRENT_TIMESTAMP
+        data.pop("created_at", None)
+
+        # 4. Insert duplicate into SQLite database
+        cols = ", ".join(data.keys())
+        placeholders = ", ".join(["?"] * len(data))
+        sql = f"INSERT INTO inventory ({cols}) VALUES ({placeholders})"
+
+        cursor.execute(sql, list(data.values()))
+
+        # Duplicate junction table mappings
+        cursor.execute(
+            "SELECT work_name FROM media_works WHERE media_id = ?", (source_media_id,)
+        )
+        works = cursor.fetchall()
+        for (w_name,) in works:
+            cursor.execute(
+                "INSERT INTO media_works (media_id, work_name) VALUES (?, ?)",
+                (new_media_id, w_name),
+            )
+
+        conn.commit()
+        conn.close()
+        return new_media_id
+
+    conn.close()
+    return None
+
+def delete_record(media_id):
+    """Deletes an item and its associated media_works links from SQLite."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM media_works WHERE media_id = ?", (media_id,))
+        cursor.execute("DELETE FROM inventory WHERE media_id = ?", (media_id,))
+        conn.commit()
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
 
 def save_or_update_item(data_dict, selected_works, is_edit_mode):
@@ -303,6 +399,15 @@ if "selected_media_id" not in st.session_state:
 if "form_mode" not in st.session_state:
     st.session_state.form_mode = "create"
 
+if "confirm_delete" not in st.session_state:
+    st.session_state.confirm_delete = False
+
+if "items_per_page" not in st.session_state:
+    st.session_state.items_per_page = 25
+
+if "current_table_page" not in st.session_state:
+    st.session_state.current_table_page = 1
+
 
 def navigate_to(page, mode="create", media_id=None):
     st.session_state.current_page = page
@@ -316,7 +421,7 @@ def navigate_to(page, mode="create", media_id=None):
 # -----------------------------------------------------------------------------
 FORMAT_OPTIONS = [
     '1" Type C',
-    "U-matic KCA",
+    "U-matic",
     "Hi8",
     "miniDV",
     "BetaMax",
@@ -397,6 +502,7 @@ BAKING_OPTIONS = ["No", "Suspected", "Yes"]
 # PAGE 1: MAIN CATALOG TABLE
 # -----------------------------------------------------------------------------
 if st.session_state.current_page == "main":
+
     col1, col2 = st.columns([1, 5], vertical_alignment="center")
 
     with col1:
@@ -425,7 +531,33 @@ if st.session_state.current_page == "main":
 
     df = fetch_inventory()
 
-    col1, col2, col3 = st.columns([2, 2, 4])
+
+    if "items_per_page" not in st.session_state:
+        st.session_state.items_per_page = 25
+
+    if "current_table_page" not in st.session_state:
+        st.session_state.current_table_page = 1
+
+    # Calculate Total Pages & Valid Boundary Ranges
+    total_records = len(df)
+    if st.session_state.items_per_page == "All":
+        items_per_page = total_records
+        total_pages = 1
+    else:
+        items_per_page = int(st.session_state.items_per_page)
+        total_pages = max(1, (total_records + items_per_page - 1) // items_per_page)
+
+    # Keep current page within bounds
+    if st.session_state.current_table_page > total_pages:
+        st.session_state.current_table_page = total_pages
+
+    # Slice Dataframe into df_page
+    start_idx = (st.session_state.current_table_page - 1) * items_per_page
+    end_idx = min(start_idx + items_per_page, total_records)
+    df_page = df.iloc[start_idx:end_idx].copy()
+
+
+    col1, col2, col3, col4 = st.columns([3, 3, 3, 3])
 
     with col1:
         if st.button("➕ Create New Entry", use_container_width=True, type="primary"):
@@ -443,12 +575,85 @@ if st.session_state.current_page == "main":
             )
             if selected_rows:
                 selected_idx = selected_rows[0]
-                selected_media_id = df.iloc[selected_idx]["media_id"]
+                selected_media_id = df_page.iloc[selected_idx]["media_id"]
                 navigate_to("form", mode="edit", media_id=selected_media_id)
             else:
                 st.warning(
                     "Please select a row from the table below before clicking Edit."
                 )
+
+    with col3:
+        duplicate_disabled = df.empty
+        if st.button(
+            "📋 Duplicate Selected Row",
+            use_container_width=True,
+            disabled=duplicate_disabled,
+        ):
+            selected_rows = (
+                st.session_state.get("table_selection", {})
+                .get("selection", {})
+                .get("rows", [])
+            )
+            if selected_rows:
+                selected_idx = selected_rows[0]
+                selected_media_id = df_page.iloc[selected_idx]["media_id"]
+                new_id = duplicate_record(selected_media_id)
+                if new_id:
+                    st.success(f"Record duplicated successfully! New ID: {new_id}")
+                    st.rerun()  # Refresh the main page to show the new record
+                else:
+                    st.error("Failed to duplicate the record.")
+            else:
+                st.warning(
+                    "Please select a row from the table below before clicking Duplicate."
+                )
+
+    with col4:
+        delete_disabled = df.empty
+        if st.button(
+            "🗑️ Delete Selected Row",
+            use_container_width=True,
+            disabled=delete_disabled,
+        ):
+            selected_rows = (
+                st.session_state.get("table_selection", {})
+                .get("selection", {})
+                .get("rows", [])
+            )
+            if selected_rows:
+                st.session_state.confirm_delete = True
+            else:
+                st.warning(
+                    "Please select a row from the table below before clicking Delete."
+                )
+    # Deletion Confirmation Dialog / Banner
+    if st.session_state.get("confirm_delete", False):
+        selected_rows = (
+            st.session_state.get("table_selection", {})
+            .get("selection", {})
+            .get("rows", [])
+        )
+        if selected_rows:
+            selected_idx = selected_rows[0]
+            del_id = df_page.iloc[selected_idx]["media_id"]
+            del_title = df_page.iloc[selected_idx]["item_title"]
+
+            st.warning(
+                f"⚠️ **Are you sure you want to delete `{del_id}` ({del_title})?** This action cannot be undone."
+            )
+            d_col1, d_col2, _ = st.columns([2, 2, 8])
+
+            with d_col1:
+                if st.button("🔥 Yes, Confirm Delete", type="primary", use_container_width=True):
+                    delete_record(del_id)
+                    st.session_state.confirm_delete = False
+                    st.toast(f"Deleted record {del_id}", icon="🗑️")
+                    st.rerun()
+
+            with d_col2:
+                if st.button("❌ Cancel", use_container_width=True):
+                    st.session_state.confirm_delete = False
+                    st.rerun()
 
     st.divider()
 
@@ -481,17 +686,103 @@ if st.session_state.current_page == "main":
         m3.metric("High Priority (Priority 1)", high_priority)
         m4.metric("Baking Required/Suspected", baking_req)
 
+        # st.markdown("### Physical Inventory Table")
+
+        # # Display Table with single-row selection
+        # event = st.dataframe(
+        #     df,
+        #     use_container_width=True,
+        #     hide_index=True,
+        #     on_select="rerun",
+        #     selection_mode="single-row",
+        #     key="table_selection",
+        # )
+        # ---------------------------------------------------------------------
+        # PAGINATION & TABLE CONTROLS
+        # ---------------------------------------------------------------------
         st.markdown("### Physical Inventory Table")
 
-        # Display Table with single-row selection
+        # Top Control Bar: Entries per page & Total count
+        p_col1, p_col2, p_col3 = st.columns([2, 3, 3], vertical_alignment="center")
+
+        with p_col1:
+            per_page_options = [10, 25, 50, 100, "All"]
+            selected_per_page = st.selectbox(
+                "Display entries per page:",
+                options=per_page_options,
+                index=per_page_options.index(st.session_state.items_per_page)
+                if st.session_state.items_per_page in per_page_options
+                else 1,
+            )
+            if selected_per_page != st.session_state.items_per_page:
+                st.session_state.items_per_page = selected_per_page
+                st.session_state.current_table_page = 1  # Reset to page 1 on limit change
+                st.rerun()
+
+        # Calculate Slicing & Page Counts
+        total_records = len(df)
+        if st.session_state.items_per_page == "All":
+            items_per_page = total_records
+            total_pages = 1
+        else:
+            items_per_page = int(st.session_state.items_per_page)
+            total_pages = max(1, (total_records + items_per_page - 1) // items_per_page)
+
+        # Ensure current page is within valid boundaries
+        if st.session_state.current_table_page > total_pages:
+            st.session_state.current_table_page = total_pages
+
+        start_idx = (st.session_state.current_table_page - 1) * items_per_page
+        end_idx = min(start_idx + items_per_page, total_records)
+
+        # Slice Dataframe for Current Page Display
+        df_page = df.iloc[start_idx:end_idx].copy()
+
+        with p_col2:
+            st.caption(
+                f"Showing **{start_idx + 1 if total_records > 0 else 0}** to **{end_idx}** of **{total_records}** entries"
+            )
+
+        # Render Table Page
         event = st.dataframe(
-            df,
+            df_page,
             use_container_width=True,
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
             key="table_selection",
         )
+
+        # Bottom Page Navigator Controls
+        nav_col1, nav_col2, nav_col3, nav_col4, nav_col5 = st.columns(
+            [1, 1, 2, 1, 1], vertical_alignment="center"
+        )
+
+        with nav_col1:
+            if st.button("⏮️ First", disabled=(st.session_state.current_table_page == 1), use_container_width=True):
+                st.session_state.current_table_page = 1
+                st.rerun()
+
+        with nav_col2:
+            if st.button("◀️ Prev", disabled=(st.session_state.current_table_page == 1), use_container_width=True):
+                st.session_state.current_table_page -= 1
+                st.rerun()
+
+        with nav_col3:
+            st.markdown(
+                f"<div style='text-align: center; font-weight: bold;'>Page {st.session_state.current_table_page} of {total_pages}</div>",
+                unsafe_allow_html=True,
+            )
+
+        with nav_col4:
+            if st.button("Next ▶️", disabled=(st.session_state.current_table_page >= total_pages), use_container_width=True):
+                st.session_state.current_table_page += 1
+                st.rerun()
+
+        with nav_col5:
+            if st.button("Last ⏭️", disabled=(st.session_state.current_table_page >= total_pages), use_container_width=True):
+                st.session_state.current_table_page = total_pages
+                st.rerun()
 
 # -----------------------------------------------------------------------------
 # PAGE 2: DATA ENTRY / EDIT FORM
@@ -500,6 +791,79 @@ elif st.session_state.current_page == "form":
     is_edit = st.session_state.form_mode == "edit"
     media_id_to_edit = st.session_state.selected_media_id
 
+    all_ids = fetch_all_media_ids()
+    current_idx = -1
+    if is_edit and media_id_to_edit in all_ids:
+        current_idx = all_ids.index(media_id_to_edit)
+
+    # Upper Bar: Title & Cancel
+    top_col1, top_col2 = st.columns([3, 1], vertical_alignment="center")
+    with top_col1:
+        header_title = (
+            f"✏️ Edit Record: `{media_id_to_edit}`"
+            if is_edit
+            else "➕ Create New Media Entry"
+        )
+        st.title(header_title)
+
+    with top_col2:
+        if st.button("⬅️ Cancel & Back to Table", use_container_width=True):
+            navigate_to("main")
+
+    # Navigation Controls Bar (Only visible in Edit mode)
+    if is_edit and all_ids:
+        st.markdown("---")
+        nav_c1, nav_c2, nav_c3, nav_c4 = st.columns([2, 3, 2, 5], vertical_alignment="bottom")
+
+        # Previous Record Button
+        with nav_c1:
+            prev_disabled = current_idx <= 0
+            if st.button(
+                "◀️ Previous Record",
+                disabled=prev_disabled,
+                use_container_width=True,
+            ):
+                prev_id = all_ids[current_idx - 1]
+                navigate_to("form", mode="edit", media_id=prev_id)
+
+        # Jump to ID Text Input + Go Button Form
+        with nav_c2:
+            with st.form("jump_to_id_form", clear_on_submit=False):
+                jump_c1, jump_c2 = st.columns([3, 2], vertical_alignment="bottom")
+                with jump_c1:
+                    target_id = st.text_input(
+                        "Jump to ID",
+                        value=media_id_to_edit if media_id_to_edit else "",
+                        label_visibility="collapsed",
+                        placeholder="Enter Media ID...",
+                    )
+                with jump_c2:
+                    jump_submitted = st.form_submit_button("Go 🎯", use_container_width=True)
+
+                if jump_submitted:
+                    target_clean = target_id.strip()
+                    if target_clean in all_ids:
+                        navigate_to("form", mode="edit", media_id=target_clean)
+                    else:
+                        st.toast(f"ID `{target_clean}` not found in catalog.", icon="⚠️")
+
+        # Next Record Button
+        with nav_c3:
+            next_disabled = current_idx < 0 or current_idx >= len(all_ids) - 1
+            if st.button(
+                "Next Record ▶️",
+                disabled=next_disabled,
+                use_container_width=True,
+            ):
+                next_id = all_ids[current_idx + 1]
+                navigate_to("form", mode="edit", media_id=next_id)
+
+        with nav_c4:
+            if current_idx >= 0:
+                st.caption(f"Showing record **{current_idx + 1}** of **{len(all_ids)}**")
+
+    st.divider()
+
     existing = None
     existing_works = []
 
@@ -507,24 +871,12 @@ elif st.session_state.current_page == "form":
         existing = fetch_item_by_id(media_id_to_edit)
         existing_works = fetch_works_for_media(media_id_to_edit)
 
-    header_title = (
-        f"✏️ Edit Record: {media_id_to_edit}"
-        if is_edit
-        else "➕ Create New Media Entry"
-    )
-    st.title(header_title)
-
-    if st.button("⬅️ Cancel & Back to Table"):
-        navigate_to("main")
-
-    st.divider()
-
     # Field Value Fallbacks
     def_id = existing["media_id"] if existing else generate_next_id()
     def_format = (
         existing["physical_format"]
         if existing and existing["physical_format"] in FORMAT_OPTIONS
-        else FORMAT_OPTIONS[0]
+        else FORMAT_OPTIONS[2]
     )
     def_brand = existing["brand_stock"] if existing else ""
     def_length = existing["tape_length"] if existing else ""
@@ -552,7 +904,7 @@ elif st.session_state.current_page == "form":
     def_runtime = (
         float(existing["estimated_runtime_min"])
         if existing and existing["estimated_runtime_min"]
-        else 60.0
+        else 120.0
     )
     def_prio = (
         existing["digitization_priority"]
@@ -710,7 +1062,7 @@ elif st.session_state.current_page == "form":
             production_reel_info = st.text_input(
                 "Production / Reel Info",
                 value=def_prod,
-                placeholder="e.g., Cam A, Show Run, Edited Master",
+                placeholder="e.g., Cam A, Show Run, Edited Master, Dub",
             )
             audio_track_info = st.text_input(
                 "Audio Track Info",
